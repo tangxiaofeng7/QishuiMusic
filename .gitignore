@@ -1,0 +1,29 @@
+# Rust
+rust/sodam-ffi/target/
+vendor/libresoda/target/
+
+# iOS：Rust 静态库是构建产物（scripts/build-ios-rust.sh 生成）
+app/ios/Rust/libsodam_ffi.a
+
+# Android：jniLibs 下的 Rust 动态库同样是构建产物
+app/android/app/src/main/jniLibs/*/libsodam_ffi.so
+
+# Flutter / 构建产物
+app/.dart_tool/
+app/.flutter-plugins*
+app/build/
+app/ios/Pods/
+app/ios/.symlinks/
+app/ios/Flutter/Generated.xcconfig
+app/ios/Flutter/flutter_export_environment.sh
+app/android/.gradle/
+app/android/local.properties
+app/android/app/.cxx/
+
+# 通用
+.DS_Store
+*.log
+artifacts/  
+
+# Rust iOS 构建产物（build-ios-rust.sh 生成）
+app/ios/Rust/

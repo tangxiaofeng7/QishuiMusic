@@ -1,0 +1,349 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>lx-frame</title>
+    <!--
+      lx-music 用户脚本运行 iframe（每个脚本一个独立 JS 上下文）。
+      由 runtime.html 动态创建：/lx/frame.html?id=<scriptId>。
+
+      职责：
+      * 同源中继改写器（XHR + fetch）：脚本发出的任意 http(s) 请求改写到
+        loopback 中继（带 __sodam_lx 标记，中继对该标记放行任意上游域），
+        无 CORS 限制；
+      * globalThis.lx 宿主 API（对齐 lx-music preload.js 的协议）：
+        EVENT_NAMES / request / on / send / utils / version / env；
+      * 与父页同源直调：window.__lxCall({source, action, info}) → Promise。
+    -->
+    <script>
+      (function () {
+        'use strict';
+        var SCRIPT_ID = '';
+        try {
+          SCRIPT_ID = new URL(location.href).searchParams.get('id') || '';
+        } catch (e) {}
+        // 生命周期第一行（同步 eval 即上报；Dart 据此区分「iframe 没加载」
+        // 与「脚本本身没跑完」）
+        try { parent.__lxNotify(SCRIPT_ID, 'log', 'frame eval'); } catch (e) {}
+
+        // ---- 同源中继改写（XHR + fetch，任意上游域）----
+        function toRelay(url) {
+          try {
+            var u = new URL(String(url), location.href);
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+            if (u.host === location.host) return null;
+            var sep = u.search ? '&' : '?';
+            return u.pathname + u.search + sep +
+                '__sodam_host=' + encodeURIComponent(u.host) +
+                '&__sodam_lx=1';
+          } catch (e) { return null; }
+        }
+        var nativeOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url) {
+          var relay = toRelay(url);
+          if (relay != null) {
+            this.__lxRealUrl = String(url);
+            var args = [method, relay];
+            for (var i = 2; i < arguments.length; i++) args.push(arguments[i]);
+            return nativeOpen.apply(this, args);
+          }
+          return nativeOpen.apply(this, arguments);
+        };
+        var nativeFetch = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+          try {
+            var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+            var relay = toRelay(url);
+            if (relay != null) {
+              if (typeof input === 'string') return nativeFetch(relay, init);
+              return nativeFetch(new Request(relay, input), init);
+            }
+          } catch (e) {}
+          return nativeFetch(input, init);
+        };
+
+        // ---- Buffer-lite / md5（脚本常用的宿主工具）----
+        function bytesOf(value) {
+          if (value instanceof Uint8Array) return value;
+          if (typeof value === 'string') {
+            var out = new Uint8Array(value.length);
+            for (var i = 0; i < value.length; i++) out[i] = value.charCodeAt(i) & 0xff;
+            return out;
+          }
+          if (value && typeof value.length === 'number') return new Uint8Array(value);
+          return new Uint8Array(0);
+        }
+        function bytesToString(bytes, format) {
+          var u8 = bytesOf(bytes);
+          if (format === 'base64') return btoa(String.fromCharCode.apply(null, u8));
+          if (format === 'hex') {
+            var hex = '';
+            for (var i = 0; i < u8.length; i++) hex += (u8[i] < 16 ? '0' : '') + u8[i].toString(16);
+            return hex;
+          }
+          var text = '';
+          for (var j = 0; j < u8.length; j++) text += String.fromCharCode(u8[j]);
+          try { return decodeURIComponent(escape(text)); } catch (e) { return text; }
+        }
+        // 纯 JS md5（输入 string（utf-8）或字节数组，输出 hex）
+        function md5(input) {
+          function rl(n, c) { return (n << c) | (n >>> (32 - c)); }
+          function ad(x, y) { return (x + y) | 0; }
+          function cmn(q, a, b, x, s, t) { return ad(rl(ad(ad(a, q), ad(x, t)), s), b); }
+          function ff(a, b, c, d, x, s, t) { return cmn((b & c) | (~b & d), a, b, x, s, t); }
+          function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & ~d), a, b, x, s, t); }
+          function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+          function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | ~d), a, b, x, s, t); }
+          var msg = bytesOf(input);
+          var n = msg.length;
+          var words = [];
+          for (var i = 0; i < n; i++) words[i >> 2] = (words[i >> 2] || 0) | (msg[i] << ((i % 4) * 8));
+          words[n >> 2] = (words[n >> 2] || 0) | (0x80 << ((n % 4) * 8));
+          var mLen = (((n + 8) >> 6) + 1) * 16;
+          for (var k = n + 1; k < mLen * 4; k++) words[k >> 2] = words[k >> 2] || 0;
+          var totalBits = n * 8;
+          words[mLen * 4 - 1] = totalBits; // 2^53 内的歌曲数据足够
+          var a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
+          for (var blk = 0; blk < mLen; blk += 16) {
+            var oa = a, ob = b, oc = c, od = d;
+            a=ff(a,b,c,d,words[blk+0],7,-680876936);d=ff(d,a,b,c,words[blk+1],12,-389564586);
+            c=ff(c,d,a,b,words[blk+2],17,606105819);b=ff(b,c,d,a,words[blk+3],22,-1044525330);
+            a=ff(a,b,c,d,words[blk+4],7,-176418897);d=ff(d,a,b,c,words[blk+5],12,1200080426);
+            c=ff(c,d,a,b,words[blk+6],17,-1473231341);b=ff(b,c,d,a,words[blk+7],22,-45705983);
+            a=ff(a,b,c,d,words[blk+8],7,1770035416);d=ff(d,a,b,c,words[blk+9],12,-1958414417);
+            c=ff(c,d,a,b,words[blk+10],17,-42063);b=ff(b,c,d,a,words[blk+11],22,-1990404162);
+            a=ff(a,b,c,d,words[blk+12],7,1804603682);d=ff(d,a,b,c,words[blk+13],12,-40341101);
+            c=ff(c,d,a,b,words[blk+14],17,-1502002290);b=ff(b,c,d,a,words[blk+15],22,1236535329);
+            a=gg(a,b,c,d,words[blk+1],5,-165796510);d=gg(d,a,b,c,words[blk+6],9,-1069501632);
+            c=gg(c,d,a,b,words[blk+11],14,643717713);b=gg(b,c,d,a,words[blk+0],20,-373897302);
+            a=gg(a,b,c,d,words[blk+5],5,-701558691);d=gg(d,a,b,c,words[blk+10],9,38016083);
+            c=gg(c,d,a,b,words[blk+15],14,-660478335);b=gg(b,c,d,a,words[blk+4],20,-405537848);
+            a=gg(a,b,c,d,words[blk+9],5,568446438);d=gg(d,a,b,c,words[blk+14],9,-1019803690);
+            c=gg(c,d,a,b,words[blk+3],14,-187363961);b=gg(b,c,d,a,words[blk+8],20,1163531501);
+            a=gg(a,b,c,d,words[blk+13],5,-1444681467);d=gg(d,a,b,c,words[blk+2],9,-51403784);
+            c=gg(c,d,a,b,words[blk+7],14,1735328473);b=gg(b,c,d,a,words[blk+12],20,-1926607734);
+            a=hh(a,b,c,d,words[blk+5],4,-378558);d=hh(d,a,b,c,words[blk+8],11,-2022574463);
+            c=hh(c,d,a,b,words[blk+11],16,1839030562);b=hh(b,c,d,a,words[blk+14],23,-35309556);
+            a=hh(a,b,c,d,words[blk+1],4,-1530992060);d=hh(d,a,b,c,words[blk+4],11,1272893353);
+            c=hh(c,d,a,b,words[blk+7],16,-155497632);b=hh(b,c,d,a,words[blk+10],23,-1094730640);
+            a=hh(a,b,c,d,words[blk+13],4,681279174);d=hh(d,a,b,c,words[blk+0],11,-358537222);
+            c=hh(c,d,a,b,words[blk+3],16,-722521979);b=hh(b,c,d,a,words[blk+6],23,76029189);
+            a=hh(a,b,c,d,words[blk+9],4,-640364487);d=hh(d,a,b,c,words[blk+12],11,-421815835);
+            c=hh(c,d,a,b,words[blk+15],16,530742520);b=hh(b,c,d,a,words[blk+2],23,-995338651);
+            a=ii(a,b,c,d,words[blk+0],6,-198630844);d=ii(d,a,b,c,words[blk+7],10,1126891415);
+            c=ii(c,d,a,b,words[blk+14],15,-1416354905);b=ii(b,c,d,a,words[blk+5],21,-57434055);
+            a=ii(a,b,c,d,words[blk+12],6,1700485571);d=ii(d,a,b,c,words[blk+3],10,-1894986606);
+            c=ii(c,d,a,b,words[blk+10],15,-1051523);b=ii(b,c,d,a,words[blk+1],21,-2054922799);
+            a=ii(a,b,c,d,words[blk+8],6,1873313359);d=ii(d,a,b,c,words[blk+15],10,-30611744);
+            c=ii(c,d,a,b,words[blk+6],15,-1560198380);b=ii(b,c,d,a,words[blk+13],21,1309151649);
+            a=ii(a,b,c,d,words[blk+4],6,-145523070);d=ii(d,a,b,c,words[blk+11],10,-1120210379);
+            c=ii(c,d,a,b,words[blk+2],15,718787259);b=ii(b,c,d,a,words[blk+9],21,-343485551);
+            a = ad(a, oa); b = ad(b, ob); c = ad(c, oc); d = ad(d, od);
+          }
+          function hex(x) {
+            var s = '', dd;
+            for (var i2 = 0; i2 < 4; i2++) {
+              dd = (x >> (i2 * 8)) & 0xff;
+              s += (dd < 16 ? '0' : '') + dd.toString(16);
+            }
+            return s;
+          }
+          return hex(a) + hex(b) + hex(c) + hex(d);
+        }
+
+        // ---- globalThis.lx 宿主 API（协议对齐 lx-music preload）----
+        var EVENT_NAMES = { request: 'request', inited: 'inited', updateAlert: 'updateAlert' };
+        var events = { request: null };
+        var isInited = false;
+        var initInfo = null;
+        var initError = '';
+
+        function notifyParent(kind, payload) {
+          try {
+            parent.__lxNotify(SCRIPT_ID, kind, payload);
+          } catch (e) {}
+        }
+
+        function lxRequest(url, options, callback) {
+          options = options || {};
+          var method = (options.method || 'get').toUpperCase();
+          var xhr = new XMLHttpRequest();
+          var target = url;
+          try { xhr.open(method, target, true); } catch (e) {
+            callback && callback(new Error('bad url: ' + e.message));
+            return function () {};
+          }
+          var headers = options.headers || {};
+          Object.keys(headers).forEach(function (name) {
+            try { xhr.setRequestHeader(name, String(headers[name])); } catch (e) {}
+          });
+          var body = null;
+          var contentTypeSet = Object.keys(headers).some(function (h) {
+            return h.toLowerCase() === 'content-type';
+          });
+          if (options.body != null) {
+            body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body);
+          } else if (options.form) {
+            body = Object.keys(options.form).map(function (k) {
+              return encodeURIComponent(k) + '=' + encodeURIComponent(options.form[k]);
+            }).join('&');
+            if (!contentTypeSet) xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+          }
+          if (body != null && !contentTypeSet) {
+            // 与 needle 的 json 语义对齐：对象 body 走 json，其余默认文本
+          }
+          xhr.timeout = Math.min(Number(options.timeout) || 60000, 60000);
+          xhr.onload = function () {
+            notifyParent('log', 'resp ' + xhr.status + ' ' + String(url).slice(0, 70));
+            var text = xhr.responseText || '';
+            var parsed = text;
+            try { parsed = JSON.parse(text); } catch (e) {}
+            var headersOut = {};
+            (xhr.getAllResponseHeaders() || '').split(/\r?\n/).forEach(function (line) {
+              var at = line.indexOf(':');
+              if (at > 0) {
+                var key = line.slice(0, at).trim().toLowerCase();
+                headersOut[key] = line.slice(at + 1).trim();
+              }
+            });
+            callback && callback(null, {
+              statusCode: xhr.status,
+              statusMessage: xhr.statusText,
+              headers: headersOut,
+              body: parsed,
+              raw: text,
+            }, parsed);
+          };
+          xhr.onerror = function () {
+            callback && callback(new Error('network error'));
+          };
+          xhr.ontimeout = function () {
+            callback && callback(new Error('timeout'));
+          };
+          try { xhr.send(body); } catch (e) {
+            callback && callback(e);
+          }
+          return function () { try { xhr.abort(); } catch (e) {} };
+        }
+
+        // 脚本元信息：Dart 在加载前解析脚本头部注释（@name/@version/…）
+        // 存入父页，frame 启动时取用（对齐 lx-music currentScriptInfo）。
+        var scriptInfo = {
+          name: SCRIPT_ID, version: '', author: '',
+          description: '', homepage: '', rawScript: '',
+        };
+        try {
+          var meta = parent.__lxMeta && parent.__lxMeta(SCRIPT_ID);
+          if (meta) {
+            meta = JSON.parse(meta);
+            ['name', 'version', 'author', 'description', 'homepage']
+              .forEach(function (key) {
+                if (meta[key]) scriptInfo[key] = String(meta[key]);
+              });
+          }
+        } catch (e) {}
+        globalThis.lx = {
+          EVENT_NAMES: EVENT_NAMES,
+          request: lxRequest,
+          on: function (eventName, handler) {
+            if (eventName !== EVENT_NAMES.request) {
+              return Promise.reject(new Error('The event is not supported: ' + eventName));
+            }
+            events.request = handler;
+            return Promise.resolve();
+          },
+          send: function (eventName, data) {
+            return new Promise(function (resolve, reject) {
+              if (eventName === EVENT_NAMES.inited) {
+                if (isInited) return reject(new Error('Script is inited'));
+                isInited = true;
+                initInfo = data;
+                notifyParent('log', 'send(inited)');
+                try {
+                  parent.__lxFrames[SCRIPT_ID].inited = data;
+                } catch (e) {}
+                notifyParent('inited', data);
+                resolve();
+              } else if (eventName === EVENT_NAMES.updateAlert) {
+                // 对齐 lx-music：脚本自检版本后上报 {log, updateUrl}，
+                // 由 App 侧展示更新卡片（父页转存，Dart 拉取）
+                notifyParent('updateAlert', data || {});
+                notifyParent('log', 'send(updateAlert)');
+                resolve();
+              } else {
+                reject(new Error('The event is not supported: ' + eventName));
+              }
+            });
+          },
+          utils: {
+            crypto: {
+              md5: md5,
+              randomBytes: function (size) {
+                var out = new Uint8Array(size);
+                crypto.getRandomValues(out);
+                return out;
+              },
+              aesEncrypt: function () { throw new Error('lx.utils.aesEncrypt 未实现'); },
+              rsaEncrypt: function () { throw new Error('lx.utils.rsaEncrypt 未实现'); },
+            },
+            buffer: {
+              from: function (value) { return bytesOf(value); },
+              bufToString: function (buf, format) { return bytesToString(buf, format); },
+            },
+            zlib: {
+              inflate: function () { return Promise.reject(new Error('lx.utils.zlib 未实现')); },
+              deflate: function () { return Promise.reject(new Error('lx.utils.zlib 未实现')); },
+            },
+          },
+          currentScriptInfo: scriptInfo,
+          version: '2.0.0',
+          env: 'mobile',
+        };
+        globalThis.Buffer = {
+          from: function (value) {
+            var u8 = bytesOf(value);
+            var arr = Array.from(u8);
+            arr.toString = function (format) { return bytesToString(u8, format || 'utf8'); };
+            return arr;
+          },
+        };
+        globalThis.__lxCall = function (payload) {
+          return new Promise(function (resolve, reject) {
+            if (!events.request) return reject(new Error('脚本未注册 request 处理器'));
+            try {
+              Promise.resolve(events.request(payload)).then(function (response) {
+                if (typeof response === 'string' && /^https?:/.test(response) && response.length <= 2048) {
+                  resolve(response);
+                } else {
+                  reject(new Error('脚本返回了无效的 URL'));
+                }
+              }).catch(reject);
+            } catch (e) { reject(e); }
+          });
+        };
+        // 生命周期上报（Dart 侧日志可见脚本到底走到哪一步）
+        notifyParent('log', 'frame ready');
+        var lastError = '';
+        window.addEventListener('error', function (event) {
+          lastError = String(event.message || '').slice(0, 200);
+          notifyParent('log', 'window error: ' + lastError);
+          if (!isInited) {
+            initError = lastError;
+            notifyParent('error', initError);
+          }
+        });
+        window.addEventListener('unhandledrejection', function (event) {
+          var message = event.reason && (event.reason.message || event.reason);
+          notifyParent('log', 'unhandled: ' + String(message).slice(0, 160));
+        });
+
+        // 加载脚本本体
+        var script = document.createElement('script');
+        script.src = '/lx-sources/' + encodeURIComponent(SCRIPT_ID) + '.js';
+        script.onerror = function () { notifyParent('error', '脚本加载失败'); };
+        document.head.appendChild(script);
+      })();
+    </script>
+  </head>
+  <body></body>
+</html>

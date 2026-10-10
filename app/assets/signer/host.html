@@ -1,0 +1,158 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>sodam-signer</title>
+    <!--
+      App 内置签名页（替代桌面版的远程「签名页服务」）。
+      由 Dart 侧的 loopback HTTP 服务（http://127.0.0.1:<port>/）承载。
+
+      WKWebView 没有桌面 Chromium 的 --disable-web-security，跨域带凭据
+      XHR 会被 CORS 直接拒绝（XMLHttpRequest network error）。因此这里用
+      「同源中继」架构：
+        1. 【必须最先安装】XHR open 改写器：api.qishui.com 的请求在
+           open() 最内层被改写成同源路径（/passport/... 原样保留）；
+        2. sdk-glue/bdms 在改写器之上加载——它看到并签名的仍是真实
+           URL（a_bogus 对 path+query 计算，改写不影响签名有效性）；
+        3. 真正的网络请求落到 Dart 的 loopback 服务，由它原生转发到
+           api.qishui.com（dart:io 无 CORS 概念），并维护 Cookie 罐。
+    -->
+    <script>
+      (function () {
+        'use strict';
+        // 白名单：允许经中继转发的上游域（汽水/抖音/字节系 passport 相关）。
+        // mcs/mon.zijieapi.com 是 bdms 的设备注册与监控（webid/tobid）——
+        // 不放行会被 CORS 拦死，bdms 遇到高危请求（如发短信）时因无法
+        // 完成设备注册而把签名队列整个挂起（签名页永久无响应）。
+        var allowedHosts = [
+          'api.qishui.com', 'www.qishui.com', 'bff-pc.qishui.com',
+          'auth.zijieapi.com', 'mcs.zijieapi.com', 'mon.zijieapi.com',
+          'sso.douyin.com', 'www.douyin.com', 'qishui.douyin.com',
+          'aweme.snssdk.com', 'lf-headquarters-speed.yhgfb-cn-static.com',
+          'lf-c-flwb.bytetos.com',
+        ];
+        var nativeOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url) {
+          try {
+            var u = new URL(String(url), location.href);
+            if ((u.protocol === 'https:' || u.protocol === 'http:') &&
+                allowedHosts.indexOf(u.host) !== -1) {
+              this.__sodamRealUrl = String(url);
+              // 路径与查询原样保留（bdms 按真实 URL 签名），真实域名经
+              // __sodam_host 查询参数带给中继（中继转发前剥掉，不影响签名）。
+              var sep = u.search ? '&' : '?';
+              var relay = u.pathname + u.search + sep +
+                  '__sodam_host=' + encodeURIComponent(u.host);
+              var args = [method, relay];
+              for (var i = 2; i < arguments.length; i++) args.push(arguments[i]);
+              return nativeOpen.apply(this, args);
+            }
+          } catch (e) {}
+          return nativeOpen.apply(this, arguments);
+        };
+      })();
+    </script>
+    <script src="react.js"></script>
+    <script src="react-dom.js"></script>
+    <script>
+      window.ucSecondVerifyReact = window.React;
+      window.ucSecondVerifyReactDom = window.ReactDOM;
+    </script>
+    <script src="sdk-glue.js"></script>
+    <script>
+      (function () {
+        'use strict';
+
+        window._SdkGlueInit({
+          self: { aid: 386088, pageId: 24554 },
+          // paths 是 bdms 拦截签名的 include 正则表：'/luna' 让免签名取流
+          // 端点（/luna/h5/track 等）的代发请求也带上 a_bogus，过指纹级风控。
+          bdms: { aid: 386088, paths: ['/passport', '/luna'] },
+        });
+
+        // bdms 走官方 CDN；8s 未就绪则注入本地快照兜底（离线/CDN 被墙）。
+        var fallbackTimer = setTimeout(function () {
+          if (!window.bdms) {
+            var s = document.createElement('script');
+            s.src = '/bdms.js';
+            s.onload = function () {
+              try { window.bdms.init({ aid: 386088, paths: ['/passport', '/luna'] }); } catch (e) {}
+            };
+            document.head.appendChild(s);
+          }
+        }, 8000);
+
+        function requestOnce(spec) {
+          return new Promise(function (resolve, reject) {
+            var xhr = new XMLHttpRequest();
+            // URL 保持真实地址：open 改写器（最内层）会把它落到同源中继。
+            xhr.open(spec.method || 'GET', spec.url, true);
+            // bdms 的拦截器按带凭据的 XHR 识别并签名（与官方页一致），必须开。
+            xhr.withCredentials = true;
+            var headers = spec.headers || {};
+            Object.keys(headers).forEach(function (name) {
+              try { xhr.setRequestHeader(name, String(headers[name])); } catch (e) {}
+            });
+            xhr.timeout = spec.timeout || 20000;
+            xhr.onload = function () {
+              resolve({
+                ok: true,
+                status: xhr.status,
+                body: xhr.responseText,
+                responseURL: xhr.__sodamRealUrl || xhr.responseURL || spec.url,
+                headers: xhr.getAllResponseHeaders() || '',
+              });
+            };
+            xhr.onerror = function () {
+              // 诊断：同源探测静态资产，区分「回环 XHR 被 WebView 拦截」
+              // 与「响应对 WebView 无效」。
+              var probe = new XMLHttpRequest();
+              probe.open('GET', '/react.js', true);
+              probe.onload = function () {
+                window.SodaSigner.postMessage(JSON.stringify({
+                  id: id, ok: false,
+                  error: 'XMLHttpRequest network error (probe=' + probe.status +
+                      '/' + probe.responseText.length + ')',
+                }));
+              };
+              probe.onerror = function () {
+                window.SodaSigner.postMessage(JSON.stringify({
+                  id: id, ok: false,
+                  error: 'XMLHttpRequest network error (probe blocked: loopback XHR unavailable)',
+                }));
+              };
+              probe.send();
+            };
+            xhr.ontimeout = function () {
+              resolve({ ok: false, error: 'XMLHttpRequest timeout' });
+            };
+            xhr.send(spec.body == null ? null : String(spec.body));
+          });
+        }
+
+        // Dart → 页面：执行一次签名请求；结果经 SodaSigner 通道回传。
+        window.__sodamCall = function (id, specJson) {
+          var spec;
+          try { spec = JSON.parse(specJson); } catch (e) {
+            window.SodaSigner.postMessage(
+              JSON.stringify({ id: id, ok: false, error: 'bad spec json' })
+            );
+            return;
+          }
+          requestOnce(spec).then(function (result) {
+            window.SodaSigner.postMessage(
+              JSON.stringify({ id: id, result: result })
+            );
+          });
+        };
+
+        // 就绪探测：bdms 出现即认为签名能力可用（CDN 失败时 8s 后本地兜底）。
+        window.__sodamReady = function () {
+          return !!window.bdms;
+        };
+      })();
+    </script>
+  </head>
+  <body></body>
+</html>

@@ -1,0 +1,248 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>lx-runtime</title>
+    <!--
+      lx-music 用户脚本运行时父页（由 Dart 的 LxRuntime 以 1x1 WebView 挂载，
+      必须在屏幕内——离屏 WebView 会被 iOS 节流）。
+      每个脚本一个同源 iframe（/lx/frame.html?id=...），独立 JS 上下文，
+      协议对齐 lx-music 的 preload/userApi 宿主。
+
+      Dart ⇄ 本页（JavaScriptChannel 'LxRuntime'）：
+      * __lxLoad(id)                    → 懒加载脚本 iframe
+      * __lxStatus()                    → 各脚本状态（同步返回）
+      * __lxMusicUrl(cbId, id, source,
+          songmid, quality)             → 异步回调 {id:cbId, ok, url|error}
+    -->
+  </head>
+  <body>
+    <script>
+      (function () {
+        'use strict';
+        window.__lxFrames = {};
+
+        // 脚本元信息（Dart 加载前解析头部注释存入；frame 启动时取用）
+        window.__lxMetaStore = {};
+
+        window.__lxNotify = function (id, kind, payload) {
+          // iframe → 父页：inited / error / log / updateAlert。
+          // 状态存 __lxFrames[id]。
+          var entry = window.__lxFrames[id];
+          if (!entry) return;
+          if (kind === 'inited') {
+            entry.inited = payload;
+            try {
+              entry.lastLog = 'inited: ' + JSON.stringify(payload).slice(0, 180);
+            } catch (e) {}
+          } else if (kind === 'error') {
+            entry.error = payload;
+          } else if (kind === 'updateAlert') {
+            // 对齐 lx-music updateAlert：脚本上报 {log, updateUrl}，
+            // 保留最新一条（Dart 经 __lxStatus 拉取展示）
+            entry.updateAlert = {
+              log: String((payload && payload.log) || '').slice(0, 2000),
+              updateUrl: String((payload && payload.updateUrl) || '').slice(0, 1024),
+              at: Date.now(),
+            };
+          } else if (kind === 'log') {
+            entry.lastLog = String(payload).slice(0, 200);
+            entry.lastLogAt = Date.now();
+          }
+        };
+
+        // Dart 侧 liveness 探针：内容进程崩溃后 eval 要么抛错要么页面空白，
+        // 都不会返回 'pong' → Dart 重载本页自愈。
+        window.__lxPing = function () { return 'pong'; };
+
+        window.__lxLoad = function (id, metaJson) {
+          var entry = window.__lxFrames[id];
+          if (metaJson) window.__lxMetaStore[id] = String(metaJson);
+          if (entry) return entry.loading ? 'loading' : 'loaded';
+          entry = window.__lxFrames[id] = {
+            loading: true, inited: null, error: '', el: null, loadedAt: 0,
+          };
+          var iframe = document.createElement('iframe');
+          iframe.src = '/lx/frame.html?id=' + encodeURIComponent(id);
+          iframe.width = '1';
+          iframe.height = '1';
+          iframe.style.border = '0';
+          iframe.onload = function () {
+            entry.loading = false;
+            entry.loadedAt = Date.now();
+            if (!entry.lastLog) entry.lastLog = 'iframe onload';
+          };
+          iframe.onerror = function () {
+            entry.loading = false;
+            entry.error = 'iframe 加载失败';
+          };
+          document.body.appendChild(iframe);
+          entry.el = iframe;
+          return 'loading';
+        };
+
+        // 卸载脚本 iframe（Dart 侧重载/删除/改内容前调用）
+        window.__lxUnload = function (id) {
+          var entry = window.__lxFrames[id];
+          if (!entry) return;
+          if (entry.el && entry.el.parentNode) {
+            entry.el.parentNode.removeChild(entry.el);
+          }
+          delete window.__lxFrames[id];
+        };
+
+        // frame.html 启动时读取自身脚本元信息（JSON 字符串，无则空串）
+        window.__lxMeta = function (id) {
+          return window.__lxMetaStore[id] || '';
+        };
+
+        // iframe 上下文活性：frame.html 会在自身文档里定义 __lxCall，
+        // 上下文被 WKWebView 回收（页面还在、iframe 文档被丢弃）后
+        // contentWindow 变空壳——这是「幽灵就绪」的判据。
+        window.__lxAlive = function (id) {
+          var entry = window.__lxFrames[id];
+          return !!(entry && entry.el && entry.el.contentWindow &&
+            entry.el.contentWindow.__lxCall);
+        };
+
+        // 幽灵就绪自愈：卸掉死 iframe 重挂（脚本重新初始化）。冷却 10s
+        // （按脚本 id 记，重挂后的新 entry 也要受控）防止脚本秒死时
+        // __lxStatus 轮询反复重建；返回是否真的重挂了。
+        var remountAt = {};
+        window.__lxRemount = function (id) {
+          var entry = window.__lxFrames[id];
+          if (!entry) return false;
+          var now = Date.now();
+          if (remountAt[id] && now - remountAt[id] < 10000) return false;
+          remountAt[id] = now;
+          if (entry.el && entry.el.parentNode) {
+            entry.el.parentNode.removeChild(entry.el);
+          }
+          delete window.__lxFrames[id];
+          window.__lxLoad(id);
+          var fresh = window.__lxFrames[id];
+          if (fresh) fresh.lastLog = 'iframe 失效，自动重挂中';
+          return true;
+        };
+
+        window.__lxStatus = function () {
+          var out = {};
+          Object.keys(window.__lxFrames).forEach(function (id) {
+            var entry = window.__lxFrames[id];
+            var alive = window.__lxAlive(id);
+            // 幽灵就绪：父页还留着 inited 数据，但 iframe 上下文已死
+            // ——重挂（脚本重新初始化）；冷却期内如实上报失效，
+            // 不复位父页数据（留给下一轮再试）。
+            if (entry.inited && !alive) {
+              if (window.__lxRemount(id)) {
+                entry = window.__lxFrames[id] || entry;
+              } else {
+                out[id] = {
+                  loading: false,
+                  error: 'iframe 失效（重挂冷却中）',
+                  ready: false,
+                  sources: null,
+                  lastLog: entry.lastLog || '',
+                };
+                return;
+              }
+            }
+            // 规范化 sources（__lxSourcesOf：只留 music 型平台、档位白名单）。
+            // 此前直接回传 inited.sources 原始对象（kw → {name,type,…}），
+            // Dart 侧按数组解析会炸/拿到垃圾档位。
+            var sources = window.__lxAlive(id) ? window.__lxSourcesOf(id) : null;
+            out[id] = {
+              loading: entry.loading,
+              error: entry.error || '',
+              ready: !!(entry.inited && entry.inited.sources &&
+                window.__lxAlive(id)),
+              sources: sources,
+              lastLog: entry.lastLog || '',
+              updateAlert: entry.updateAlert || null,
+            };
+          });
+          return out;
+        };
+
+        // 规范化脚本 inited 的 sources（宽松解析，字段缺失给默认值）
+        var ALL_SOURCES = ['kw', 'kg', 'tx', 'wy', 'mg', 'local'];
+        window.__lxSourcesOf = function (id) {
+          var entry = window.__lxFrames[id];
+          if (!entry || !entry.inited || !entry.inited.sources) return null;
+          var out = {};
+          ALL_SOURCES.forEach(function (source) {
+            var info = entry.inited.sources[source];
+            if (!info || info.type !== 'music') return;
+            var qualitys = Array.isArray(info.qualitys) ? info.qualitys.filter(function (q) {
+              return ['128k', '320k', 'flac', 'flac24bit'].indexOf(q) !== -1;
+            }) : [];
+            if (!qualitys.length) return;
+            out[source] = qualitys;
+          });
+          return out;
+        };
+
+        window.__lxMusicUrl = function (cbId, id, source, songmid, quality, name, singer) {
+          function reply(ok, payload) {
+            window.LxRuntime.postMessage(JSON.stringify({
+              id: cbId, ok: ok, result: payload,
+            }));
+          }
+          var entry = window.__lxFrames[id];
+          if (!entry) {
+            window.__lxLoad(id);
+            return reply(false, '脚本未加载');
+          }
+          if (entry.error && !entry.inited) {
+            return reply(false, '脚本初始化失败: ' + entry.error);
+          }
+          var frame = entry.el && entry.el.contentWindow;
+          if (!frame || !frame.__lxCall) {
+            // 幽灵就绪落点：状态还是就绪、上下文已回收——重挂自愈，
+            // 本次调用只能失败（脚本重初始化要数秒）。
+            window.__lxRemount(id);
+            return reply(false, '脚本上下文已失效（已自动重挂，稍后重试）');
+          }
+          try {
+            // lx-music v2 脚本协议：request 事件收到
+            // {source, action, info: {musicInfo, type}}，musicInfo 为
+            // MusicInfoDetail（songmid/hash/id/source…）。此前只传扁平
+            // songmid，脚本读 info.musicInfo.* 全是 undefined → 全部出链失败。
+            // name/singer 透传：部分脚本按歌名+歌手在平台内自搜。
+            var musicInfo = {
+              id: songmid,
+              songmid: songmid,
+              hash: songmid,
+              source: source,
+              name: name || '',
+              singer: singer || '',
+              interval: 0,
+              albumName: '',
+              albumId: '',
+              qualitys: {},
+              meta: {},
+            };
+            frame.__lxCall({
+              source: source,
+              action: 'musicUrl',
+              info: {
+                musicInfo: musicInfo,
+                type: quality,
+                // 顶层冗余字段（个别脚本直接读 info.songmid/info.quality）
+                songmid: songmid,
+                hash: songmid,
+                quality: quality,
+              },
+            }).then(function (url) {
+              reply(true, url);
+            }).catch(function (error) {
+              reply(false, String((error && error.message) || error).slice(0, 200));
+            });
+          } catch (error) {
+            reply(false, String(error).slice(0, 200));
+          }
+        };
+      })();
+    </script>
+  </body>
+</html>

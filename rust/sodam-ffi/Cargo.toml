@@ -1,0 +1,38 @@
+[package]
+name = "sodam-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "SodaM 移动端 FFI 桥：把汽水引擎（原 libresoda，已整体内联进 src/）包装成 C ABI（JSON 进出），供 Flutter Dart FFI 调用"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/sodahub-org/sodam"
+
+[lib]
+name = "sodam_ffi"
+# staticlib → iOS（Xcode 链接 .a）；cdylib → Android（lib sodam_ffi.so）
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# ↓ 以下三项为内联引擎（src/http.rs / src/soda/crypto.rs）所需，
+#   版本与原 vendor/libresoda 的非默认依赖保持一致。
+# 移动端 HTTP 客户端（tls + gzip，无默认特性，不引入 socks 代理栈）。
+ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
+# play_auth（spade）密钥还原与 CENC 样本解密（AES-CTR）。
+aes = "0.8"
+ctr = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+base64 = "0.22"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[dependencies.regex]
+version = "1"
+default-features = false
+features = ["std", "perf", "unicode-perl"]

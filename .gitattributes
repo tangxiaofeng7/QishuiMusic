@@ -1,0 +1,14 @@
+# 统一行尾：脚本必须 LF，否则 macOS/Linux CI 上 bash 报错
+*.sh text eol=lf
+*.dart text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.podspec text eol=lf
+
+# 二进制产物
+*.a binary
+*.so binary
+*.ipa binary
+*.apk binary

@@ -1,0 +1,12 @@
+#include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"
+#include "Generated.xcconfig"
+
+// Rust 核心静态库（内联汽水引擎）：由 scripts/build-ios-rust.sh 产出
+// 到 ios/Rust/libsodam_ffi.a。本项目插件走 Swift Package Manager（无 CocoaPods）。
+// OTHER_LDFLAGS 由 xcode_backend 应用到 App.framework 的链接：
+// -force_load 装载整个静态库；-Wl,-u 把三个 FFI 符号标记为"被引用"，
+// 否则 dylib 链接的 dead-strip 会把无人引用的符号全部剪掉
+// （症状：dlsym(RTLD_DEFAULT, sodam_init) symbol not found）。
+// Dart 经 DynamicLibrary.process() 查符号。
+// （Profile 构建复用 Release.xcconfig）
+OTHER_LDFLAGS = -force_load $(PROJECT_DIR)/Rust/libsodam_ffi.a -Wl,-u,_sodam_init -Wl,-u,_sodam_request -Wl,-u,_sodam_free

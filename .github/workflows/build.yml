@@ -1,0 +1,197 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+# Release 需要写权限（默认只读 token 会 403）
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: 质量门禁（analyze + 单测）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 单测
+        run: cargo test --manifest-path rust/sodam-ffi/Cargo.toml
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter 静态分析 + 单测
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze --fatal-infos
+          flutter test
+
+  build-ios:
+    name: iOS 无签名 IPA（巨魔 / 自签可用）
+    needs: test
+    runs-on: macos-15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（iOS 交叉目标）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/sodam-ffi/target
+          key: rust-ios-${{ runner.os }}-${{ hashFiles('vendor/libresoda/Cargo.toml', 'rust/sodam-ffi/Cargo.toml') }}
+
+      - name: 编译 Rust 静态库
+        run: |
+          bash scripts/build-ios-rust.sh
+          ls -lh app/ios/Rust/
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.6
+          cache: true
+
+      - name: Flutter 依赖
+        working-directory: app
+        run: flutter pub get
+
+      - name: 构建 xcarchive（无签名）
+        working-directory: app
+        run: |
+          APP_VERSION=$(awk '/^version:/{print $2; exit}' pubspec.yaml)
+          flutter build ipa --no-codesign --release \
+            --dart-define=APP_VERSION="$APP_VERSION"
+
+      - name: 打包无签名 IPA
+        run: bash scripts/package-ipa.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: QishuiMusic-iOS-unsigned
+          path: app/build/ios/QishuiMusic-unsigned.ipa
+
+  build-android:
+    name: Android APK
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust（Android 交叉目标）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: 安装 cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: 安装 NDK
+        run: |
+          # GH Actions 的 bash 默认 -o pipefail：yes 被 SIGPIPE 杀掉时退出码 141
+          # 会误判失败，这里对 sdkmanager 的管道临时关掉 pipefail
+          set +o pipefail
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.1.12297006" >/dev/null
+          set -o pipefail
+          test -d "$ANDROID_HOME/ndk/27.1.12297006" || { echo "NDK 安装失败"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/sodam-ffi/target
+          key: rust-android-${{ runner.os }}-${{ hashFiles('vendor/libresoda/Cargo.toml', 'rust/sodam-ffi/Cargo.toml') }}
+
+      - name: 编译 Rust 动态库
+        run: |
+          bash scripts/build-android-rust.sh
+          find app/android/app/src/main/jniLibs -name '*.so' -exec ls -lh {} \;
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 构建 APK
+        working-directory: app
+        run: |
+          flutter pub get
+          APP_VERSION=$(awk '/^version:/{print $2; exit}' pubspec.yaml)
+          flutter build apk --release \
+            --dart-define=APP_VERSION="$APP_VERSION"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: QishuiMusic-Android
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
+  release:
+    name: 发布 Release（仅打 tag 时）
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-ios, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # 鸿蒙（HarmonyOS）：占位 job，移植方案见 docs/HARMONYOS-PORT.md。
+      # 工程就绪后把 if: false 去掉、在这里挂 hap 产物即可三平台齐发。
+      - name: 鸿蒙占位说明
+        run: |
+          echo "HarmonyOS(hap) 构建未启用：ohos 平台移植进行中"
+          echo "当前 Release 为 iOS + Android 双平台"
+
+      - name: 产物重命名（QishuiMusic-<tag>-<平台>）
+        run: |
+          cd dist
+          mv QishuiMusic-iOS-unsigned/QishuiMusic-unsigned.ipa \
+             "QishuiMusic-${GITHUB_REF_NAME}-ios-unsigned.ipa"
+          mv QishuiMusic-Android/app-release.apk \
+             "QishuiMusic-${GITHUB_REF_NAME}-android.apk"
+          ls -lh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/QishuiMusic-*-ios-unsigned.ipa
+            dist/QishuiMusic-*-android.apk
+          generate_release_notes: true
